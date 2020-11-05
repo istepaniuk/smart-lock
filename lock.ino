@@ -1,22 +1,30 @@
+#ifdef __JETBRAINS_IDE__
+#define ICACHE_RAM_ATTR /**/
+#endif
+
 #include "RotaryEncoder.h"
 #include <ESP8266WiFi.h>
 #include <PubSubClient.h>
 
 #define LED_PIN   2 //D4
-#define MOTOR_A_PIN 13 //D7
-#define MOTOR_B_PIN 4 //D2
-#define MOTOR_EN_PIN 16 //D0
 
-#define ENCODER_A_PIN 12 //D6
-#define ENCODER_B_PIN 14 //D5
+#define MOTOR_A_PIN 12 //D6
+#define MOTOR_B_PIN 13 //D7
+#define MOTOR_EN_PIN 14 //D5
+
+#define ENCODER_A_PIN 5 //D1
+#define ENCODER_B_PIN 4 //D2
 
 #define MOTOR_HOME_RETRACT_COUNT 180
-#define MOTOR_HOME_STALL_THRESHOLD 50
+#define MOTOR_HOME_STALL_THRESHOLD 5
 #define MOTOR_STEPS_IN_ONE_TURN 1364
+#define MOTOR_PWM_FREQ 200
+#define MOTOR_FULL_SPEED 1023
+#define MOTOR_HOMING_SPEED 500
 
 #define WIFI_SSID ""
 #define WIFI_PASSWORD ""
-#define MQTT_SERVER "192.168.118.10"
+#define MQTT_SERVER ""
 #define MQTT_USER "guest"
 #define MQTT_PASSWORD "guest"
 #define MQTT_TOPIC_STATUS "lock.status"
@@ -31,6 +39,9 @@ enum states {
   state_unlocking,
   state_locking,
   state_locked,
+  state_unlatching,
+  state_unlatched_stalled,
+  state_unlatched_retracting
 };
 
 WiFiClient esp_client;
@@ -56,11 +67,12 @@ void setup() {
     pinMode(MOTOR_A_PIN, OUTPUT);
     pinMode(MOTOR_B_PIN, OUTPUT);
     pinMode(MOTOR_EN_PIN, OUTPUT);
-    
+
     digitalWrite(MOTOR_A_PIN, LOW);
     digitalWrite(MOTOR_B_PIN, LOW);
-    digitalWrite(MOTOR_EN_PIN, HIGH);
-    
+    digitalWrite(MOTOR_EN_PIN, LOW);
+    analogWriteFreq(MOTOR_PWM_FREQ);
+
     Serial.begin(115200);
     setup_wifi();
     client.setServer(MQTT_SERVER, 1883);
@@ -105,85 +117,45 @@ void setup_wifi() {
     Serial.println(WiFi.localIP());
 }
 
-void loop() {
-    if (!client.connected()) {
-        reconnect();
-    }
+void motor_cw_on() {
+    digitalWrite(MOTOR_A_PIN, LOW);
+    digitalWrite(MOTOR_B_PIN, HIGH);
+}
 
-    client.loop();
+void motor_ccw_on() {
+    digitalWrite(MOTOR_A_PIN, HIGH);
+    digitalWrite(MOTOR_B_PIN, LOW);
+}
 
-    long new_motor_position = encoder.getPosition();
+void motor_stop() {
+    digitalWrite(MOTOR_A_PIN, HIGH);
+    digitalWrite(MOTOR_B_PIN, HIGH);
+}
 
-    if (motor_position != new_motor_position) {
-        motor_position = new_motor_position;
-        Serial.print("pos: ");
-        Serial.println(String(new_motor_position).c_str());
-
-    }
-
+void update_motor_driver() {
     switch (state) {
+        case state_home_needed:
+        case state_homed_stalled:
         case state_locked:
         case state_unlocked:
-            digitalWrite(MOTOR_A_PIN, HIGH);
-            digitalWrite(MOTOR_B_PIN, HIGH);
+            motor_stop();
             break;
         case state_unlocking:
-            digitalWrite(MOTOR_A_PIN, HIGH);
-            digitalWrite(MOTOR_B_PIN, LOW);
-            if (motor_position >= 4 * MOTOR_STEPS_IN_ONE_TURN) {
-                state = state_unlocked;
-            }
+            analogWrite(MOTOR_EN_PIN, MOTOR_FULL_SPEED);
+            motor_ccw_on();
             break;
         case state_locking:
-            digitalWrite(MOTOR_A_PIN, LOW);
-            digitalWrite(MOTOR_B_PIN, HIGH);
-            if (motor_position < 0) {
-                state = state_locked;
-            }
+            analogWrite(MOTOR_EN_PIN, MOTOR_FULL_SPEED);
+            motor_cw_on();
             break;
-        case state_home_needed:
-            digitalWrite(MOTOR_A_PIN, HIGH);
-            digitalWrite(MOTOR_B_PIN, HIGH);
-            motor_position = 0;
-            homing_loop_counter = 0;
-            last_motor_position_on_homing_counter_overflow = motor_position;
-            break;
-        case state_homed_stalled:
-            state = state_homed_retracting;
-            encoder.setPosition(-MOTOR_HOME_RETRACT_COUNT);
-            break;            
         case state_homing:
-            //slower?
-            digitalWrite(MOTOR_A_PIN, LOW);
-            digitalWrite(MOTOR_B_PIN, HIGH);
-            homing_loop_counter++;
-            if (homing_loop_counter > 100000) {
-
-                Serial.print("moved: ");
-                Serial.println(String(last_motor_position_on_homing_counter_overflow - motor_position).c_str());
-                
-                if ((last_motor_position_on_homing_counter_overflow - motor_position) < MOTOR_HOME_STALL_THRESHOLD) {
-                    state = state_homed_stalled;
-                }
-                homing_loop_counter = 0;
-                last_motor_position_on_homing_counter_overflow = motor_position;
-            }
+            analogWrite(MOTOR_EN_PIN, MOTOR_HOMING_SPEED);
+            motor_cw_on();
             break;
         case state_homed_retracting:
-            //slower?
-            digitalWrite(MOTOR_A_PIN, HIGH);
-            digitalWrite(MOTOR_B_PIN, LOW);
-            if (motor_position >= 0) {
-                state = state_locked;
-            }
+            analogWrite(MOTOR_EN_PIN, MOTOR_HOMING_SPEED);
+            motor_ccw_on();
             break;
-    }
-
-    //digitalWrite(LED_PIN, LOW);
-
-    if (state != last_published_state) {
-        last_published_state = state;
-        publish_state();
     }
 }
 
@@ -235,10 +207,78 @@ void callback(char *topic, byte *payload, unsigned int length) {
     }
 
     if (msgString == cmd_lock) {
-        state = state_locking;
+        if (state == state_unlocked) {
+            state = state_locking;
+        }
     } else if (msgString == cmd_unlock) {
-        state = state_unlocking;
+        if (state == state_locked) {
+            state = state_unlocking;
+        }
     } else if (msgString == cmd_home) {
         state = state_homing;
+        motor_position = 0;
+        homing_loop_counter = 0;
+    }
+}
+
+void loop() {
+    if (!client.connected()) {
+        reconnect();
+    }
+
+    client.loop();
+
+    long new_motor_position = encoder.getPosition();
+
+    if (motor_position != new_motor_position) {
+        motor_position = new_motor_position;
+        Serial.print("pos: ");
+        Serial.println(String(new_motor_position).c_str());
+
+    }
+
+    switch (state) {
+        case state_unlocking:
+            if (motor_position >= 2 * MOTOR_STEPS_IN_ONE_TURN) {
+                state = state_unlocked;
+            }
+            break;
+        case state_locking:
+            if (motor_position < 0) {
+                state = state_locked;
+            }
+            break;
+        case state_home_needed:
+            motor_position = 0;
+            homing_loop_counter = 0;
+            last_motor_position_on_homing_counter_overflow = 0;
+            break;
+        case state_homed_stalled:
+            state = state_homed_retracting;
+            encoder.setPosition(-MOTOR_HOME_RETRACT_COUNT);
+            break;
+        case state_homing:
+            homing_loop_counter++;
+            if (homing_loop_counter > 60000) {
+                Serial.print("moved: ");
+                Serial.println(String(last_motor_position_on_homing_counter_overflow - motor_position).c_str());
+                if ((last_motor_position_on_homing_counter_overflow - motor_position) < MOTOR_HOME_STALL_THRESHOLD) {
+                    state = state_homed_stalled;
+                }
+                homing_loop_counter = 50000;
+                last_motor_position_on_homing_counter_overflow = motor_position;
+            }
+            break;
+        case state_homed_retracting:
+            if (motor_position >= 0) {
+                state = state_locked;
+            }
+            break;
+    }
+
+    if (state != last_published_state) {
+        last_published_state = state;
+        publish_state();
+        update_motor_driver();
     }
 }
