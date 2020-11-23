@@ -1,7 +1,4 @@
-#ifdef __JETBRAINS_IDE__
-#define ICACHE_RAM_ATTR /**/
-#endif
-
+#include <Arduino.h>
 #include "RotaryEncoder.h"
 #include <ESP8266WiFi.h>
 #include <PubSubClient.h>
@@ -22,9 +19,9 @@
 #define MOTOR_FULL_SPEED 1023
 #define MOTOR_HOMING_SPEED 500
 
-#define WIFI_SSID ""
-#define WIFI_PASSWORD ""
-#define MQTT_SERVER ""
+#define WIFI_SSID "sdfgsdfg"
+#define WIFI_PASSWORD "sdgfsdfg"
+#define MQTT_SERVER "sdfgsdf"
 #define MQTT_USER "guest"
 #define MQTT_PASSWORD "guest"
 #define MQTT_TOPIC_STATUS "lock.status"
@@ -56,7 +53,8 @@ long homing_loop_counter = 0;
 int state = state_home_needed;
 int last_published_state = -1;
 
-void ICACHE_RAM_ATTR encoderISR() {
+void ICACHE_RAM_ATTR
+encoderISR() {
     encoder.readAB();
 }
 
@@ -138,6 +136,7 @@ void update_motor_driver() {
         case state_homed_stalled:
         case state_locked:
         case state_unlocked:
+        case state_unlatched_stalled:
             motor_stop();
             break;
         case state_unlocking:
@@ -155,6 +154,14 @@ void update_motor_driver() {
         case state_homed_retracting:
             analogWrite(MOTOR_EN_PIN, MOTOR_HOMING_SPEED);
             motor_ccw_on();
+            break;
+        case state_unlatching:
+            analogWrite(MOTOR_EN_PIN, MOTOR_FULL_SPEED);
+            motor_ccw_on();
+            break;
+        case state_unlatched_retracting:
+            analogWrite(MOTOR_EN_PIN, MOTOR_HOMING_SPEED);
+            motor_cw_on();
             break;
     }
 }
@@ -187,6 +194,15 @@ void publish_state() {
         case state_locked:
             Serial.println("state_locked");
             break;
+        case state_unlatching:
+            Serial.println("state_unlatching");
+            break;
+        case state_unlatched_stalled:
+            Serial.println("state_unlatched_stalled");
+            break;
+        case state_unlatched_retracting:
+            Serial.println("state_unlatched_retracting");
+            break;
     }
 }
 
@@ -194,6 +210,7 @@ void callback(char *topic, byte *payload, unsigned int length) {
     const char *cmd_lock = "lock";
     const char *cmd_unlock = "unlock";
     const char *cmd_home = "home";
+    const char *cmd_unlatch = "unlatch";
 
     int i = 0;
     for (i = 0; i < length; i++) {
@@ -218,6 +235,10 @@ void callback(char *topic, byte *payload, unsigned int length) {
         state = state_homing;
         motor_position = 0;
         homing_loop_counter = 0;
+    } else if (msgString == cmd_unlatch) {
+        if (state == state_unlocked) {
+            state = state_unlatching;
+        }
     }
 }
 
